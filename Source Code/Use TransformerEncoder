@@ -1,1 +1,353 @@
+# Preparing dataset for transformer
+import os
+import numpy as np
+from torch.utils.data import Dataset
+from PIL import Image
+import torch
 
+def calculate_dataset_average_frames(root_dir):
+    frame_counts = []
+    # Traverse each activity folder and each video to count frames
+    for activity in os.listdir(root_dir):
+        activity_path = os.path.join(root_dir, activity)
+        if os.path.isdir(activity_path):
+            for video in os.listdir(activity_path):
+                video_path = os.path.join(activity_path, video)
+                if os.path.isdir(video_path):
+                    frames = os.listdir(video_path)
+                    frame_counts.append(len(frames))
+    # Calculate the average frame count across the entire dataset
+    return int(np.mean(frame_counts))
+
+# Usage example to get the max_frames threshold
+train_root_dir = "/kaggle/input/yoloed"
+max_frames = calculate_dataset_average_frames(train_root_dir)
+test_root_dir = "/kaggle/input/yoloedtest"
+print("Overall dataset average frame count:", max_frames)
+
+# VideoFrameDataset class
+class VideoFrameDataset(Dataset):
+    def __init__(self, root_dir, transform=None, max_frames=30, label_mapping=None):
+        """
+        A dataset class for handling videos with a uniform frame count.
+        
+        Args:
+            root_dir (str): Root directory containing activity folders.
+            transform (callable, optional): Transformations to be applied on frames.
+            max_frames (int): Target number of frames per video.
+            label_mapping (dict, optional): Mapping from activity labels to integer values.
+        """
+        self.root_dir = root_dir
+        self.transform = transform
+        self.max_frames = max_frames
+        self.samples = self._load_samples()
+        
+        # If no label_mapping provided, create one from samples
+        if label_mapping is None:
+            unique_labels = sorted({label for _, label in self.samples})
+            self.label_mapping = {label: idx for idx, label in enumerate(unique_labels)}
+        else:
+            self.label_mapping = label_mapping
+        
+        # Reverse mapping for potential label lookup
+        self.reverse_label_mapping = {idx: label for label, idx in self.label_mapping.items()}
+
+    def _load_samples(self):
+        samples = []
+        for activity in os.listdir(self.root_dir):
+            activity_path = os.path.join(self.root_dir, activity)
+            if os.path.isdir(activity_path):
+                for video in os.listdir(activity_path):
+                    video_path = os.path.join(activity_path, video)
+                    if os.path.isdir(video_path):
+                        frames = sorted([os.path.join(video_path, f) for f in os.listdir(video_path)])
+                        samples.append((frames, activity))
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        frames, label = self.samples[idx]
+
+        # Load frames and apply transformations
+        images = [Image.open(frame_path).convert("RGB") for frame_path in frames]
+        if self.transform:
+            images = [self.transform(image) for image in images]
+
+        # Padding or truncating based on max_frames
+        if len(images) < self.max_frames:
+            padding = [torch.zeros_like(images[0]) for _ in range(self.max_frames - len(images))]
+            images.extend(padding)
+        else:
+            images = images[:self.max_frames]
+
+        images_tensor = torch.stack(images)
+
+        # Convert label to integer using the label_mapping
+        label_tensor = torch.tensor(self.label_mapping[label])
+
+        return images_tensor, label_tensor
+
+# Instantiate the train dataset with label mapping
+train_dataset = VideoFrameDataset(
+    root_dir=train_root_dir,
+    transform=preprocess,
+    max_frames=max_frames
+)
+
+# Instantiate the test dataset, sharing the label mapping from train_dataset
+test_dataset = VideoFrameDataset(
+    root_dir=test_root_dir,
+    transform=preprocess,
+    max_frames=max_frames,
+    label_mapping=train_dataset.label_mapping  # Use the same label mapping
+)
+
+print("Label mapping used:", train_dataset.label_mapping)
+
+
+
+#optimization1 ... showing 94.22% accuracy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+from torchvision import models
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+
+class ImprovedResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(ImprovedResNet, self).__init__()
+        self.base_model = models.resnet34(weights='DEFAULT')
+        self.features = nn.Sequential(*list(self.base_model.children())[:-2])
+        self.bn = nn.BatchNorm2d(512)  # Added BatchNorm
+        self.dropout = nn.Dropout(0.2)
+        
+    def forward(self, x):
+        x = self.features(x)
+        x = self.bn(x)
+        return self.dropout(x)
+
+class EnhancedResNetTransformer(nn.Module):
+    def __init__(self, checkpoint_path, num_classes, d_model=512, num_heads=8, num_layers=4):
+        super(EnhancedResNetTransformer, self).__init__()
+        
+        # ResNet34 feature extractor
+        self.resnet = ImprovedResNet(num_classes)
+        checkpoint = torch.load(checkpoint_path)
+        self.resnet.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        
+        # Dual pooling for better feature representation
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))  # Pool to (1, 1)
+        self.max_pool = nn.AdaptiveMaxPool2d((1, 1))  # Pool to (1, 1)
+        
+        # Feature projection with skip connection
+        self.feature_proj = nn.Sequential(
+            nn.Linear(512 * 2, d_model),  # 512 * 2 for avg and max features
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Improved transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=2048,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-layer norm for stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Learnable query for temporal attention
+        self.query = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # Enhanced classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, num_classes)
+        )
+        
+    def forward(self, x):
+        batch_size, num_frames, c, h, w = x.size()
+        
+        # Process frames
+        x = x.view(-1, c, h, w)
+        features = self.resnet(x)  # (B*T, 512, H', W')
+        
+        # Dual pooling
+        avg_features = self.avg_pool(features).view(batch_size, num_frames, -1)  # (B, T, 512)
+        max_features = self.max_pool(features).view(batch_size, num_frames, -1)  # (B, T, 512)
+        features = torch.cat([avg_features, max_features], dim=-1)  # (B, T, 1024)
+        
+        # Reshape and project
+        features = self.feature_proj(features)  # (B, T, d_model)
+        
+        # Transformer processing
+        features = self.transformer(features)  # (B, T, d_model)
+        
+        # Temporal attention pooling
+        query = self.query.expand(batch_size, -1, -1)  # (B, 1, d_model)
+        attention_weights = torch.bmm(query, features.transpose(1, 2))  # (B, 1, T)
+        attention_weights = torch.softmax(attention_weights / math.sqrt(features.size(-1)), dim=-1)
+        features = torch.bmm(attention_weights, features).squeeze(1)  # (B, d_model)
+        
+        # Classification
+        output = self.classifier(features)
+        
+        return output, attention_weights
+
+def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Optimizer with different learning rates for different components
+    optimizer = optim.AdamW([
+        {'params': model.resnet.parameters(), 'lr': 1e-4},
+        {'params': model.feature_proj.parameters(), 'lr': 2e-4},
+        {'params': model.transformer.parameters(), 'lr': 2e-4},
+        {'params': model.classifier.parameters(), 'lr': 2e-4}
+    ], weight_decay=0.01)
+    
+    # Cosine annealing scheduler with warmup
+    warmup_epochs = 5
+    def warmup_scheduler(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        else:
+            return 0.5 * (1 + math.cos(math.pi * (epoch - warmup_epochs) / (num_epochs - warmup_epochs)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_scheduler)
+    
+    scaler = GradScaler()
+    model = model.to(device)
+    best_accuracy = 0
+    patience = 7
+    patience_counter = 0
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        correct = 0
+        total = 0
+        
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
+        for inputs, labels in train_bar:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Mixed precision training
+            with autocast():
+                outputs, _ = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            # Check for NaN loss
+            if torch.isnan(loss).any():
+                print("NaN loss detected!")
+                break
+            
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            # Update progress bar
+            train_bar.set_postfix({
+                'loss': f'{train_loss/total:.4f}',
+                'acc': f'{100.*correct/total:.2f}%'
+            })
+        
+        train_accuracy = 100. * correct / total
+        
+        # Testing phase
+        model.eval()
+        test_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in tqdm(test_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Testing"):
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs, _ = model(inputs)
+                loss = criterion(outputs, labels)
+                
+                test_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+        
+        test_accuracy = 100. * correct / total
+        
+        # Learning rate scheduling
+        scheduler.step()
+        
+        # Save best model and handle early stopping
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_accuracy': best_accuracy
+            }, 'best_model.pth')
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        print(f'\nEpoch: {epoch+1}/{num_epochs}')
+        print(f'Train Loss: {train_loss/len(train_loader):.4f} | Train Acc: {train_accuracy:.2f}%')
+        print(f'Test Loss: {test_loss/len(test_loader):.4f} | Test Acc: {test_accuracy:.2f}%')
+        print(f'Best Acc: {best_accuracy:.2f}%\n')
+        print("patience is : ",patience_counter)
+        
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model = EnhancedResNetTransformer(
+        checkpoint_path='/kaggle/input/resnet34trained/pytorch/default/1/best_model_epoch_50.pth',
+        num_classes=101,
+        d_model=512,
+        num_heads=8,
+        num_layers=4
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    train_model(model, train_loader, test_loader, num_epochs=50, device=device)
+
+if __name__ == '__main__':
+    main()
