@@ -1,0 +1,75 @@
+#extracting frames from the dataset
+import os
+import cv2
+import shutil
+
+def extract_and_save_frames(video_path, frame_output_dir, interval=8):
+    cap = cv2.VideoCapture(video_path)
+
+    frame_count = 0
+    success, frame = cap.read()
+    
+    saved_frame_count = 0  # To ensure consecutive numbering of saved frames
+    
+    while success:
+        # Process the frame only if it's at the specified interval
+        if (frame_count % interval == 0):
+            # Save frame as JPEG file
+            frame_filename = os.path.join(frame_output_dir, f"frame_{saved_frame_count:04d}.jpg")
+            cv2.imwrite(frame_filename, frame)
+            saved_frame_count += 1
+        
+        # Read the next frame
+        success, frame = cap.read()
+        frame_count += 1
+
+    cap.release()
+
+def process_all_videos(input_dir, output_dir):
+    # Iterate through each activity folder in the input directory
+    for activity_folder in os.listdir(input_dir):
+        
+        activity_name = activity_folder  
+        activity_path = os.path.join(input_dir, activity_name)
+
+        # Create the output directory for the activity
+        store_activity = os.path.join(output_dir, activity_name)
+        if not os.path.exists(store_activity):
+            os.makedirs(store_activity)  # Use makedirs to create intermediate directories if needed
+        print(activity_path)
+
+        for video_name in os.listdir(activity_path):
+            video_path = os.path.join(activity_path, video_name)
+            if os.path.isfile(video_path) and video_name.endswith(('.mp4', '.avi', '.mov')):  # Add supported formats
+                print(f"Processing video: {video_name} for activity: {activity_name}")
+                frame_output_dir = os.path.join(store_activity, os.path.splitext(video_name)[0])  # Use splitext to get the name without extension
+                if not os.path.exists(frame_output_dir):
+                    os.makedirs(frame_output_dir)
+                extract_and_save_frames(video_path, frame_output_dir)  # Set interval to 8
+
+        # Create a zip file of the frames directory
+        zip_output_dir = '/kaggle/working/working2'
+        if not os.path.exists(zip_output_dir):
+            os.makedirs(zip_output_dir)
+        shutil.make_archive(f'{zip_output_dir}/{activity_name}', 'zip', store_activity)
+# Define your input and output paths
+input_dir = '/kaggle/input/ucf101/train/'  # Update this to your actual input directory containing activity folders
+output_dir = '/kaggle/working/frames'
+
+# Create output directory if it doesn't exist
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Run the processing function
+process_all_videos(input_dir, output_dir)
+# Define your input and output paths
+input_dir = '/kaggle/input/ucf101/test/'  # Update this to your actual input directory containing activity folders
+output_dir = '/kaggle/working/frames'
+
+# Create output directory if it doesn't exist
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Run the processing function
+process_all_videos(input_dir, output_dir)
+
