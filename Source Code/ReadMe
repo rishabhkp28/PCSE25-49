@@ -39,12 +39,3 @@ VideoFrameDataset class is formed to form dataset for the transformer by arranin
 Integration of Resnet34 is done with Transformer Encoder.
 
 
-
-
-
-
-
-
-    
-
-Use YOLOV8 contains the code required to extract the person of interest from the frames
