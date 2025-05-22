@@ -33,6 +33,7 @@ Working directory/
     ├── v_YoYo_g01_c02.avi----(contains respective extracted frames)
     └── ...
 
+
 All these extracted frames activities were comnbined to form a folder called ucf101extracted and similarly for ucf101extractedtest
 
 Step 2.)Using YOLOV8
