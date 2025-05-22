@@ -1,0 +1,301 @@
+#Using Residual Network
+import os
+import cv2
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image
+from torch.utils.data import DataLoader
+
+# Define a transformation pipeline for ResNet input
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),  # Resize to 224x224 for ResNet
+    transforms.ToTensor(),          # Convert to PyTorch tensor
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize using ImageNet stats
+])
+
+#creating dataset for ResNet
+class FrameDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform           
+        self.samples = self._load_samples()
+        
+        # Precompute label to index mapping
+        self.label_mapping = self._create_label_mapping()
+        self.reverse_label_mapping = self.index_to_label() # Call the method without arguments
+
+    def _load_samples(self):
+        samples = []
+        # Traverse the dataset directory
+        for activities in os.listdir(self.root_dir):
+            videos_path = os.path.join(self.root_dir,activities)
+            for video in os.listdir(videos_path):
+                video_path = os.path.join(videos_path,video)
+                for frame_file in os.listdir(video_path):
+                    frame_path = os.path.join(video_path, frame_file)
+                    label = activities  # Use folder name as label
+                    samples.append((frame_path, activities))
+        return samples
+
+    def _create_label_mapping(self):
+        # Create a label-to-index mapping just once
+        labels = sorted(os.listdir(self.root_dir))  # Sort to maintain consistent ordering
+        label_mapping = {label: idx for idx, label in enumerate(labels)}
+        return label_mapping
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        frame_path, label = self.samples[idx]
+        
+        # Load the image
+        image = Image.open(frame_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Use the precomputed label mapping
+        label_index = self.label_mapping[label]
+        
+        return image, label_index
+
+    def index_to_label(self):
+        """Retrieve the activity label from the index."""
+        reverse_label_mapping = {v: k for k, v in self.label_mapping.items()}
+        return reverse_label_mapping
+
+
+
+
+
+import os
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import models
+import numpy as np
+from tqdm import tqdm
+
+class ImprovedResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(ImprovedResNet, self).__init__()
+        self.base_model = models.resnet34(weights='DEFAULT')
+        self.dropout = nn.Dropout(0.2)
+        self.bn = nn.BatchNorm1d(self.base_model.fc.in_features)
+        self.fc = nn.Linear(self.base_model.fc.in_features, num_classes)
+        self.base_model.fc = nn.Identity()
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = self.bn(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+def train_model(train_dataset, test_dataset, num_epochs=50, mixup_enabled=True):
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    model = ImprovedResNet(num_classes=len(train_dataset.label_mapping))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=0.01,
+        amsgrad=True
+    )
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        verbose=True
+    )
+
+    os.makedirs('saved_models', exist_ok=True)
+    best_val_acc = 0.0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        correct = 0
+        total = 0
+        start_time = time.time()
+
+        for images, labels in tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{num_epochs}', total=len(train_loader)):
+            images, labels = images.to(device), labels.to(device)
+
+            # Apply MixUp only if enabled and after 5 epochs
+            if mixup_enabled and epoch > 5 and torch.rand(1) < 0.3:
+                lam = np.random.beta(0.8, 0.8)  # Less aggressive mixup
+                rand_index = torch.randperm(images.size(0)).to(device)
+                mixed_x = lam * images + (1 - lam) * images[rand_index]
+                outputs = model(mixed_x)
+                loss = lam * criterion(outputs, labels) + (1 - lam) * criterion(outputs, labels[rand_index])
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for images, labels in tqdm(test_loader, desc=f'Validating Epoch {epoch + 1}/{num_epochs}', total=len(test_loader)):
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+
+        train_loss /= len(train_loader)
+        train_acc = 100. * correct / total
+        val_loss /= len(test_loader)
+        val_acc = 100. * val_correct / val_total
+        elapsed_time = time.time() - start_time
+
+        print(f'Epoch: {epoch + 1}')
+        print(f'Training Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%')
+        print(f'Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.2f}%, Time: {elapsed_time:.2f}s')
+
+        # Learning rate scheduling
+        scheduler.step(val_loss)
+
+        # Save model if validation accuracy improves
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+            }, f'saved_models/best_model_epoch_{epoch + 1}.pth')
+            print(f"Saved new best model for epoch {epoch + 1} with validation accuracy {val_acc:.2f}%")
+
+    return model
+
+
+train_dataset = FrameDataset(root_dir="/kaggle/input/yoloed", transform=preprocess) 
+test_dataset = FrameDataset(root_dir="/kaggle/input/yoloedtest", transform=preprocess)
+
+# Create data loaders
+batch_size = 32
+train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+trained_model = train_model(train_dataset, test_dataset, num_epochs=50)
+
+
+#MODEL EVALUATION
+
+#ResNet evaluation
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torchvision import models  # Import the models module from torchvision
+
+# Define the ImprovedResNet model structure as previously defined
+class ImprovedResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(ImprovedResNet, self).__init__()
+        self.base_model = models.resnet34(weights='DEFAULT')
+        self.dropout = nn.Dropout(0.2)
+        self.bn = nn.BatchNorm1d(self.base_model.fc.in_features)
+        self.fc = nn.Linear(self.base_model.fc.in_features, num_classes)
+        self.base_model.fc = nn.Identity()
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = self.bn(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+# Load the saved model checkpoint
+checkpoint_path = '/kaggle/input/resnet34trained/pytorch/default/1/best_model_epoch_50.pth'  # Update with actual path and epoch
+checkpoint = torch.load(checkpoint_path)
+
+# Initialize the model and load checkpoint
+num_classes = 101  # Update this with the actual number of classes
+model = ImprovedResNet(num_classes)
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()  # Set to evaluation mode
+
+# Move model to GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+
+# Define the evaluation criterion
+criterion = nn.CrossEntropyLoss()
+
+def evaluate_model(model, test_dataset):
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    test_loss = 0.0
+    correct = 0
+    total = 0
+
+    # No gradient calculation needed during testing
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc="Evaluating Model", leave=True):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    test_loss /= len(test_loader)
+    test_accuracy = 100. * correct / total
+
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_accuracy:.2f}%")
+
+# Assuming test_dataset is already defined in this notebook
+evaluate_model(model, test_dataset)
