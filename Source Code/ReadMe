@@ -31,11 +31,13 @@ After the preprocessing is done ,the frames in the ucf101extracted and ucf101ext
 form similar directory structure again. The root directories were named yoloed for train data and yoloedtest for test data.
 
 3.) Using ResNet34
-Now when the data is obtained for the purpose of frame extraction the Frame Dataset class is formed to form a dataset for Resnet and data loaders 
+Now when the data is obtained for the purpose of feature extraction, the Frame Dataset class is formed to form a dataset for Resnet and data loaders 
 were prepared for training and testing.
+With each epoch the better model was saved into the database.
 
 4.) Using Transformer Encoder
 VideoFrameDataset class is formed to form dataset for the transformer by arraning the video frames in sequence and labelling them.
 Integration of Resnet34 is done with Transformer Encoder.
+With each epoch the better model was saved into the database.
 
 
